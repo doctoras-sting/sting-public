@@ -258,6 +258,31 @@ function clearStoredKey(key) {
     // localStorageが使えない環境では何もしない
   }
 }
+// 翻訳履歴専用: 「保存から24時間」ではなく「今日(暦日)のものかどうか」で保持するため、
+// loadWithExpiry/saveWithExpiryとは別の小さなヘルパーにする(考え方はONE_DAY_MSと同じく時間で手放す仕組み)。
+function isSameLocalDay(ts) {
+  const a = new Date(ts);
+  const b = new Date();
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+}
+function loadTranslationHistoryToday(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((e) => typeof e.createdAt === "number" && isSameLocalDay(e.createdAt));
+  } catch (e) {
+    return [];
+  }
+}
+function saveTranslationHistory(key, list) {
+  try {
+    localStorage.setItem(key, JSON.stringify(list));
+  } catch (e) {
+    // localStorageが使えない環境では永続化のみ諦め、アプリの動作自体は継続する
+  }
+}
 const TRANSLATION_HISTORY_STORAGE_KEY = "sting_translationHistory";
 const ROLEPLAY_TARGET_STORAGE_KEY = "sting_roleplayTarget";
 const ROLEPLAY_CASE_DATA_STORAGE_KEY = "sting_roleplayCaseData";
@@ -525,6 +550,42 @@ function getRecognition(lang) {
   return r;
 }
 
+// 音声再生の共通処理。すでに何か再生中の場合は、新しい再生を開始しない(同じボタンの連打による二重再生を防ぐ)。
+function speakOnce(text, langCode) {
+  if (!window.speechSynthesis) return;
+  if (window.speechSynthesis.speaking) return;
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = langCode;
+  window.speechSynthesis.speak(u);
+}
+
+// 音声認識結果の後処理。明らかな疑問文と判断できる場合だけ「?」を補い、
+// 中国語で「你好/您好」の直後に次の文がそのまま続いている場合だけ、挨拶の後に「。」を補う。
+// 判定が曖昧な場合は何もしない(誤った補完を避けるため、機械的にすべての文へ適用しない)。
+function postprocessRecognizedText(text, langCode) {
+  let t = (text || "").trim();
+  if (!t) return t;
+
+  if (langCode.startsWith("zh")) {
+    const greetingMatch = t.match(/^(你好|您好)(?![，。！？,.!?\s])(.+)$/);
+    if (greetingMatch && greetingMatch[2].trim()) {
+      t = `${greetingMatch[1]}。${greetingMatch[2]}`;
+    }
+  }
+
+  if (/[?？]$/.test(t)) return t; // すでに疑問符が付いている場合はそのまま
+
+  const isQuestion = langCode.startsWith("zh")
+    ? /(吗|呢|什么|怎么样|怎么|哪里|哪儿|几点|多少|谁|为什么|是不是|好吗|可以吗|能不能|行吗)/.test(t) || /^请问/.test(t)
+    : /^(what|how|could|would|can|do|does|did|is|are|was|were|will|should|may|which|who|where|when|why)\b/i.test(t);
+
+  if (isQuestion) {
+    t = t.replace(/[。.!！,，]+$/, "");
+    t = t + (langCode.startsWith("zh") ? "？" : "?");
+  }
+  return t;
+}
+
 export default function App() {
   const [screen, setScreen] = useState("translate"); // translate | mydict | bulk | chat | review | history | settings | roleplayHub | roleplaySelect | roleplayCase | roleplayChat | roleplayReview
   const [lastMainScreen, setLastMainScreen] = useState("translate");
@@ -782,15 +843,13 @@ export default function App() {
 
   // 翻訳履歴: 保存操作をする余裕がなかった翻訳を後から拾えるようにするための一時的な記録。
   // 辞書(expressions)とは別物で、ここに入っただけでは辞書には保存されない。
-  // 直近5件のみ保持(古いものは自動的に切り捨て、無期限に増え続けない)。
-  // 現状このアプリ全体に永続化の仕組みが無いため、他の状態(expressions/folders等)と同様、
-  // アプリを開いている間だけメモリ上に保持される(セッションが終わると消える)。
-  const [translationHistory, setTranslationHistory] = useState(() => loadWithExpiry(TRANSLATION_HISTORY_STORAGE_KEY, []));
+  // 件数での上限は設けず、「今日(暦日)のもの」だけを保持する(日付が変わったら前日分は対象から外れる)。
+  const [translationHistory, setTranslationHistory] = useState(() => loadTranslationHistoryToday(TRANSLATION_HISTORY_STORAGE_KEY));
   useEffect(() => {
-    saveWithExpiry(TRANSLATION_HISTORY_STORAGE_KEY, translationHistory);
+    saveTranslationHistory(TRANSLATION_HISTORY_STORAGE_KEY, translationHistory);
   }, [translationHistory]);
   const pushTranslationHistory = (entry) => {
-    setTranslationHistory((prev) => [{ id: newId("h"), ...entry }, ...prev].slice(0, 5));
+    setTranslationHistory((prev) => [{ id: newId("h"), createdAt: Date.now(), ...entry }, ...prev.filter((e) => isSameLocalDay(e.createdAt))]);
   };
 
   const ROLEPLAY_SCREENS = ["roleplayHub", "roleplaySetup", "roleplaySelect", "roleplayCase", "roleplayChat", "roleplayReview"];
@@ -1392,6 +1451,7 @@ function TranslateScreen({ expressions, lang, onSave, checkSimilarBeforeSave, ch
   const [result, setResult] = useState("");
   const [pinyin, setPinyin] = useState("");
   const [yomi, setYomi] = useState(""); // 保存時のインデックス分類用。既存の翻訳APIレスポンスに相乗りして取得する(専用のAPI呼び出しは増やさない)
+  const [sentenceUnits, setSentenceUnits] = useState([]); // 今回の翻訳を一文単位に分けたもの({ja, en, yomi, pinyin})。表示はresult(結合済み)を使い、履歴への追加だけこちらを使う
   const [caution, setCaution] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -1400,6 +1460,25 @@ function TranslateScreen({ expressions, lang, onSave, checkSimilarBeforeSave, ch
   const [listening, setListening] = useState(false);
   const [hintVisible, setHintVisible] = useState(false);
   const recogRef = useRef(null);
+  const isFirstLangRender = useRef(true);
+
+  // 英⇔中の言語切り替え時に、直前の翻訳(日本語入力・訳文・ピンイン等)をすべてクリアし、
+  // 新しい翻訳として開始できるようにする(初回マウント時にはクリアしない)。
+  useEffect(() => {
+    if (isFirstLangRender.current) {
+      isFirstLangRender.current = false;
+      return;
+    }
+    setJa("");
+    setTranslatedJa("");
+    setResult("");
+    setPinyin("");
+    setYomi("");
+    setSaved(false);
+    setCaution(false);
+    setError("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lang]);
 
   // 自分専用の予測入力: 保存済み表現(このアプリの「学習・蓄積」の核)から、入力中の文字に対応する候補を出す。
   // 一般的なAI予測変換ではなく、優先順位を「入力そのものの前方一致 → 数字/漢数字を同一視した前方一致 →
@@ -1443,6 +1522,7 @@ function TranslateScreen({ expressions, lang, onSave, checkSimilarBeforeSave, ch
     setResult("");
     setPinyin("");
     setYomi("");
+    setSentenceUnits([]);
     setSaved(false);
     setCaution(false);
     // 日本語をまったく含まない入力(例: "hello"や"nihao"のようなローマ字だけの入力)は、
@@ -1455,44 +1535,61 @@ function TranslateScreen({ expressions, lang, onSave, checkSimilarBeforeSave, ch
     setLoading(true);
     setError("");
     try {
+      // STINGでは「仕事で使う言葉」を一文単位で練習・登録したいため、翻訳自体は1回のAPI呼び出しのまま、
+      // 日本語を文末(。！？など)の区切りで意味のまとまりごとに分け、文ごとの訳文・読みをまとめて取得する。
+      // 表示だけは、これらを結合した1つのまとまった翻訳結果として見せる(内部の分割単位とは分離する)。
       const out = await callClaude(
-        `次の日本語を自然な${langOf(lang).label}に翻訳してください。\n` +
+        `次の日本語を、文末(。！？など)の区切りで意味のまとまりごとの文に分け、それぞれを自然な${langOf(lang).label}に翻訳してください。区切れる文が1つだけの場合は、配列の要素は1つだけにしてください。\n` +
           `${POV_INSTRUCTION}\n` +
           `原文に無い具体的な文脈(仕事・学校・特定の相手など)を勝手に補わないでください。原文が持つ意味の範囲を超えないようにしてください。\n` +
           `特に文脈が明示されていない場合は、原文の意味をそのまま保った、汎用的で自然な表現にしてください。\n` +
           `数量・回数・日付・期間などの具体的な数字表現は、原文と正確に一致させてください(例:「来週」と「再来週」、「1日2回」と「1日3回」のような、隣接する数字・期間を取り違えないよう特に注意してください)。\n` +
           `訳文には、注意書き・断り書き・補足説明などを一切含めず、翻訳結果の文章だけを入れてください。\n` +
           `次のJSON形式のみを出力してください(説明やコードブロック記号は不要です)。\n` +
-          `{"translation":"訳文のみ(前置き・注意書きなし)","yomi":"日本語原文(「${ja}」)の読みをひらがなのみで(漢字・カタカナ・句読点・記号は含めない)","caution":true または false(相手を傷つける可能性のある攻撃的・侮辱的な内容が原文に含まれる場合はtrue、それ以外はfalse)}\n\n` +
+          `{"sentences":[{"ja":"区切られた日本語の1文(元の表記のまま)","translation":"その文の訳文のみ(前置き・注意書きなし)","yomi":"その文の日本語の読みをひらがなのみで(漢字・カタカナ・句読点・記号は含めない)"${lang === "cn" ? `,"pinyin":"その文の訳文のピンイン"` : ""}}],"caution":true または false(相手を傷つける可能性のある攻撃的・侮辱的な内容が原文に含まれる場合はtrue、それ以外はfalse)}\n\n` +
           `日本語: ${ja}`
       );
       const cleaned = out.replace(/```json|```/g, "").trim();
-      let translated = "";
+      let units = [];
       let cautionFlag = false;
-      let yomiResult = "";
       try {
         const parsed = JSON.parse(cleaned);
-        translated = (parsed.translation || "").replace(/^["「]|["」]$/g, "").trim();
+        const sentencesRaw = Array.isArray(parsed.sentences) ? parsed.sentences : [];
         cautionFlag = !!parsed.caution;
-        // yomiはひらがな以外の文字が混ざっていた場合、インデックス分類を誤らせないよう使わない(空文字のままフォールバックさせる)
-        const yomiRaw = (parsed.yomi || "").trim();
-        yomiResult = /^[\u3041-\u3096ー]+$/.test(yomiRaw) ? yomiRaw : "";
+        units = sentencesRaw
+          .map((s) => {
+            const yomiRaw = (s.yomi || "").trim();
+            return {
+              ja: (s.ja || "").trim(),
+              en: (s.translation || "").replace(/^["「]|["」]$/g, "").trim(),
+              // yomiはひらがな以外の文字が混ざっていた場合、インデックス分類を誤らせないよう使わない(空文字のままフォールバックさせる)
+              yomi: /^[\u3041-\u3096ー]+$/.test(yomiRaw) ? yomiRaw : "",
+              pinyin: lang === "cn" ? (s.pinyin || "").trim() : "",
+            };
+          })
+          .filter((u) => u.ja && u.en);
       } catch (parseErr) {
-        // JSONで返ってこなかった場合は、そのままの文字列を訳文として使う(注意フラグは立てない)
-        translated = cleaned.replace(/^["「]|["」]$/g, "").trim();
+        // JSONで返ってこなかった場合は、そのままの文字列を訳文として使い、一文だけの結果として扱う(注意フラグは立てない)
+        units = [{ ja: ja.trim(), en: cleaned.replace(/^["「]|["」]$/g, "").trim(), yomi: "", pinyin: "" }];
       }
+      // 中国語のみ、既存のfetchPinyinで訳文全体のピンインを補う(AIが返さなかった場合のフォールバック)
+      if (lang === "cn" && units.some((u) => !u.pinyin)) {
+        for (const u of units) {
+          if (!u.pinyin && u.en) u.pinyin = await fetchPinyin(u.en);
+        }
+      }
+      const translated = units.map((u) => u.en).join(lang === "cn" ? "" : " ");
+      const pinyinResult = lang === "cn" ? units.map((u) => u.pinyin).filter(Boolean).join(" ") : "";
       setResult(translated);
       setCaution(cautionFlag);
-      setYomi(yomiResult);
-      let pinyinResult = "";
-      if (lang === "cn") {
-        pinyinResult = await fetchPinyin(translated);
-        setPinyin(pinyinResult);
-      }
-      // 翻訳が成功したら、保存する/しないに関わらず必ず履歴に残す(履歴自体は辞書への保存ではない)
-      if (translated) {
+      setYomi(units[0]?.yomi || "");
+      setPinyin(pinyinResult);
+      setSentenceUnits(units);
+      // 翻訳が成功したら、保存する/しないに関わらず必ず履歴に残す(履歴自体は辞書への保存ではない)。
+      // 表示は結合した1つの翻訳結果だが、履歴には一文ずつ独立した項目として追加し、後から1文だけ登録できるようにする。
+      if (units.length > 0) {
         setTranslatedJa(ja);
-        onTranslated?.({ ja, en: translated, lang, pinyin: pinyinResult });
+        units.forEach((u) => onTranslated?.({ ja: u.ja, en: u.en, lang, pinyin: u.pinyin }));
       }
     } catch (e) {
       setError("翻訳に失敗しました。もう一度お試しください。");
@@ -1532,10 +1629,7 @@ function TranslateScreen({ expressions, lang, onSave, checkSimilarBeforeSave, ch
   };
 
   const speak = (text) => {
-    if (!window.speechSynthesis) return;
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = langOf(lang).speech;
-    window.speechSynthesis.speak(u);
+    speakOnce(text, langOf(lang).speech);
   };
 
   // 保存ボタンを押した瞬間だけ、共通の類似表現チェックを経由する(入力中の高速検索とは別枠)
@@ -1570,7 +1664,7 @@ function TranslateScreen({ expressions, lang, onSave, checkSimilarBeforeSave, ch
       setError("この環境では音声入力に対応していません。テキスト入力をご利用ください。");
       return;
     }
-    r.onresult = (ev) => setJa((prev) => (prev ? prev + ev.results[0][0].transcript : ev.results[0][0].transcript));
+    r.onresult = (ev) => setJa(ev.results[0][0].transcript);
     r.onend = () => setListening(false);
     r.onerror = () => {
       setListening(false);
@@ -1579,6 +1673,7 @@ function TranslateScreen({ expressions, lang, onSave, checkSimilarBeforeSave, ch
     try {
       recogRef.current = r;
       setListening(true);
+      setJa(""); // 音声入力開始時点で、既存の日本語入力をクリアする(今回認識した内容だけを新しいjaとして扱う)
       r.start();
     } catch (e) {
       setListening(false);
@@ -1901,10 +1996,7 @@ function MyDictScreen({ folders, expressions, setFolders, setExpressions, showTo
   };
 
   const speak = (text) => {
-    if (!window.speechSynthesis) return;
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = langOf(lang).speech;
-    window.speechSynthesis.speak(u);
+    speakOnce(text, langOf(lang).speech);
   };
 
   const translateForAdd = async () => {
@@ -2360,10 +2452,7 @@ function TranslationHistoryScreen({ history, expressions, onSave, checkSimilarBe
   const [patientItem, setPatientItem] = useState(null);
 
   const speak = (text, itemLang) => {
-    if (!window.speechSynthesis) return;
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = langOf(itemLang).speech;
-    window.speechSynthesis.speak(u);
+    speakOnce(text, langOf(itemLang).speech);
   };
 
   const isSaved = (item) => expressions.some((e) => e.lang === item.lang && normalizeJa(e.ja) === normalizeJa(item.ja));
@@ -3028,10 +3117,7 @@ function ExpressionDetail({ expr, expressions, folders, setFolders, setExpressio
   const otherSibling = expressions.find((e) => e.lang === otherCode && e.conceptId === expr.conceptId);
 
   const speakExpr = (text) => {
-    if (!window.speechSynthesis) return;
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = langOf(expr.lang).speech;
-    window.speechSynthesis.speak(u);
+    speakOnce(text, langOf(expr.lang).speech);
   };
 
   const startCreateOther = async () => {
@@ -3474,9 +3560,8 @@ function ReviewScreen({ expressions, lang, priorityIds, onFinish, onAddTrainingT
       return;
     }
     r.onresult = (ev) => {
-      const text = ev.results[0][0].transcript;
+      const text = postprocessRecognizedText(ev.results[0][0].transcript, langOf(lockedLang).speech);
       setAnswer(text);
-      judge(text);
     };
     r.onend = () => setListening(false);
     r.onerror = () => {
@@ -3494,10 +3579,7 @@ function ReviewScreen({ expressions, lang, priorityIds, onFinish, onAddTrainingT
   };
 
   const speak = (text) => {
-    if (!window.speechSynthesis) return;
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = langOf(lockedLang).speech;
-    window.speechSynthesis.speak(u);
+    speakOnce(text, langOf(lockedLang).speech);
   };
 
   const next = () => {
@@ -3737,7 +3819,7 @@ async function generateRoleplayCase(targetExpr, siblingExpressions, lang, rolepl
     `・患者の自覚症状(かゆみが良くなった等)と、医師が確認する客観的所見(発疹が広がっている等)が異なる方向を示すこと自体は自然な診察でよくあることです。矛盾として扱わず、両立する情報として設計してください。\n\n` +
     (lang === "cn" ? `・患者の最初の一言のピンインも作ってください(動作部分のピンインは不要です)。\n\n` : "") +
     `次のJSON形式のみを出力してください(説明・コードブロック記号は不要です)。\n` +
-    `{"selfRole":"ユーザー自身の役割の呼び方(日本語、例:医師)","counterpartRole":"会話相手の役割の呼び方(日本語、例:患者)","visitType":"first"または"return","age":年齢の数字,"gender":"male"または"female","patientBrief":"この場面が始まる前からすでに分かっている情報をまとめた文章(日本語。年齢・性別・経緯などを含め、指定された職種・役割・場面に自然な一つの文章としてまとめる。新しい事実は作らず、すでに決めた内容だけを整理する)","findings":"客観的な所見のみ(日本語、主観情報は含めない、不要なら空文字)","labResults":"検査結果の内容(日本語、不要なら空文字)","historyContext":"質問された場合に会話相手が答える背景情報(日本語。目標表現に直接関係する1〜2項目だけを選び、1〜2文程度の簡潔な文で書く。網羅的な記録のように書かないこと。ユーザーには表示せず、会話相手役が一貫して答えるための土台としてのみ使う。不要なら空文字)","underlyingCondition":"内部的に想定する状況・背景の候補(日本語。ユーザーには表示しないが、会話中に新しい確認事項を求められた場合に結果を矛盾なく作るための土台として使う)","openingLine":"会話相手の最初の一言(${langOf(lang).label})","openingLineJa":"その日本語訳"${pinyinField ? "," + pinyinField : ""}}`;
+    `{"selfRole":"ユーザー自身の役割の呼び方(日本語、例:医師)","counterpartRole":"会話相手の役割の呼び方(日本語、例:患者)","visitType":"first"または"return","age":年齢の数字,"gender":"male"または"female","patientBrief":"この場面が始まる前からすでに分かっている情報をまとめた文章(日本語。年齢・性別・経緯などを含め、指定された職種・役割・場面に自然な一つの文章としてまとめる。新しい事実は作らず、すでに決めた内容だけを整理する。ただし、selfRole自身が会話の中で自然に名乗る個人を特定する情報(特に氏名)は、ここで具体的な値を固定しないでください。予約番号・予約内容・宿泊日数・部屋タイプなど、場面上必要なその他の情報はこれまで通り含めてください)","findings":"客観的な所見のみ(日本語、主観情報は含めない、不要なら空文字)","labResults":"検査結果の内容(日本語、不要なら空文字)","historyContext":"質問された場合に会話相手が答える背景情報(日本語。目標表現に直接関係する1〜2項目だけを選び、1〜2文程度の簡潔な文で書く。網羅的な記録のように書かないこと。ユーザーには表示せず、会話相手役が一貫して答えるための土台としてのみ使う。不要なら空文字)","underlyingCondition":"内部的に想定する状況・背景の候補(日本語。ユーザーには表示しないが、会話中に新しい確認事項を求められた場合に結果を矛盾なく作るための土台として使う)","openingLine":"会話相手の最初の一言(${langOf(lang).label})","openingLineJa":"その日本語訳"${pinyinField ? "," + pinyinField : ""}}`;
   // 以前はcallClaudeの呼び出し自体(ネットワーク断・APIの一時的なエラー応答など)をtryの外に置いていたため、
   // callClaude自体が例外を投げた場合だけ、下のcatchで捕捉されずgenerateRoleplayCaseの外(呼び出し元の
   // RoleplayCaseScreen)まで素通りしてしまっていた(getRoleplayTurnで既に修正済みなのと同じ構造の問題)。
@@ -3887,7 +3969,7 @@ async function getRoleplayConversationTurn(targetExpr, caseData, transcript, tur
     `・counterpartRoleとして、ユーザーの直前の発言に自然に反応してください。ユーザーの発言に反応せず勝手に話を進めないでください。\n` +
     `・シナリオに内部情報(所見・検査結果・背景情報など)が存在することと、counterpartRoleが会話のその時点ですでにそれを知っていることは同じではありません。特に、counterpartRole自身がユーザーに何かを尋ねたり確認を求めたりした直後に、ユーザーがまだ答えていない場合、またはユーザーが「確認します」「調べます」「後で伝えます」のようにまだ情報を取得していないことを示す発言をした場合は、シナリオの内部情報を使ってその答えを先取りして自分で述べないでください。この場合は、自然に待つ・確認を促す・その時点で会話上すでに得られている情報だけを使って別の話題を続けるなど、counterpartRoleとして自然に反応してください。これは、会話の一貫性を保つため、既に会話上明らかになっている内容と矛盾しないため、counterpartRole自身が本来知っている立場・背景を維持するために内部情報を使うこと自体を禁止するものではありません。\n` +
     `・リアルさより、練習として成立することを優先してください(過度な脱線はしない)。\n` +
-    `・ケース上の設定(所見・検査結果など)は「正解」として強制しないでください。医師が確認・判断するもの(所見の内容、検査結果の陽性/陰性、それらに基づく医学的判断など)について、ユーザーが所見・検査結果を確認せずに自分の判断で発言した場合も、その発言を会話上の事実として扱い、実際のケース設定の値で訂正しないでください(訂正しないでください)。これは、患者自身の主訴・体感(かゆみ・痛みなど患者本人の感覚)については患者側の認識を優先して維持する別のルールとは区別してください(そちらは変更しません)。\n` +
+    `・ケース上の設定(所見・検査結果など)は「正解」として強制しないでください。selfRoleが確認・判断するもの(所見の内容、検査結果の陽性/陰性、それらに基づく医学的判断など)について、ユーザーが所見・検査結果を確認せずに自分の判断で発言した場合も、その発言を会話上の事実として扱い、実際のケース設定の値で訂正しないでください(訂正しないでください)。これは、患者自身の主訴・体感(かゆみ・痛みなど患者本人の感覚)については患者側の認識を優先して維持する別のルールとは区別してください(そちらは変更しません)。\n` +
     `・上記の「すでに実施済みの追加検査」に書かれている検査については、患者は既に受けたものとして扱ってください(例:「これから受けるんですね」「まだ検査していません」のような発言は不可)。\n` +
     `・検査に関する患者の発言は、現在の検査の進行状況(検査前／検査実施／結果待ち／結果判明／結果説明)と矛盾しないようにしてください。特に、結果がすでに判明・説明されている検査について、「検査前に知っておくべきことはありますか？」のような検査前を前提にした発言をしないでください。会話ログとケース情報(所見・検査結果・追加検査の状態)から、今どの段階にいるかを毎回確認してから発言を作ってください。\n` +
     `・重要(ロールプレイの目的): このロールプレイの目的は診療全体をシミュレーションすることではなく、目標表現をこの仕事の場面で自然に言えるようにする練習です。目標表現を自然に言うために必要な最小限の前後の会話だけを作り、それ以外の長い診療過程や実際の時間経過(例:検査結果が出るまでの数日〜1週間など)を会話の中で再現しないでください。例えば目標表現が「検査結果は1週間後です」のように結果が出るまでの期間を伝える一文である場合、実際に1週間分の時間を進めたり、後日の再診を同じロールプレイで再現したりする必要はありません。医師が検査を提案→検査実施→患者が結果の判明時期を尋ねる→医師が目標表現を言う→患者が短く自然に反応する→終了に向かう、という短い流れで完結させてください。\n` +
@@ -3978,7 +4060,7 @@ async function getRoleplayConfirmationTurn(targetExpr, caseData, transcript, tur
     `目標表現(ユーザーがこの会話の中で言えるようになりたい日本語): ${targetExpr.ja}\n\n` +
     `これまでの会話(現在${turnCount}往復目。最後の行が、ユーザーの直前の発言に対する${counterpartRole}の今回の返答です):\n${transcriptText}\n${counterpartRole}: ${patientReply}\n\n` +
     `方針:\n` +
-    `・selfRole・counterpartRoleのどちらか一方が、所見・検査結果・その他の確認事項を求めた場合は、次の優先順位で判断してください。確認・判断を行おうとしている側を「確認する側」、その内容を保持・提供する側を「確認される側」と呼びますが、どちらがselfRoleでどちらがcounterpartRoleかは固定されていません。今回のselfRole・counterpartRoleの関係と、直前までの会話の流れから、実際にどちらが確認する側でどちらが確認される側なのかを、その都度自然に判断してください(例:selfRoleが自分から何かを確認しようとしている場合はselfRoleが確認する側に、counterpartRoleが確認・提示を行っている場合はcounterpartRoleが確認する側になります)。①まず、確認する側が確認しようとしている対象を特定してください。対象は今回の発言だけで判断する必要はなく、今回の発言に明示されていない場合は、直前の会話の話題・流れから自然に1つの対象が読み取れるかを確認し、読み取れる場合はその対象を採用してください(例:一方が直前に何かを尋ね、確認する側が「確認します」とだけ答えた場合、その直前の話題が対象になります)。対象は、直前の会話で実際に具体的に話題になっていた事柄に限ってください。氏名・生年月日のような、場面や話題に関わらずどんな時でも存在してしまう一般的な基本情報を、対象が定まらない場合の代わりとして選ばないでください。今回の発言にも直前の会話にも、対象を特定できる手がかりが無い場合は、対象を勝手に作り出さず、通常の応答(確認行為ではない扱い)にとどめてください。対象が定まった場合は、次に、その確認について、selfRoleが具体的な内容(氏名・予約番号・希望条件など)を持っていて、その内容を答える・確認してもらう必要があるかを確認してください。selfRoleが物・資料を提示するだけで、その中身についてselfRole自身が具体的な内容を会話上答える必要が無い場合(例:身分証・パスポートなどを提示するだけで、記載内容を自分から答える必要はない場合)は、newTestRequestedをtrueにせず、通常の応答(確認行為ではない扱い)にとどめてください。selfRoleがその内容を持っていて、それを答える・確認してもらう必要がある場合(例:氏名・予約番号・希望条件などをselfRole自身が答える場合)は、次の判定に進んでください(これは「selfRoleが確認する側か確認される側か」とは別の判定であり、selfRoleが確認される側であっても、selfRoleが具体的な内容を答える必要があるなら対象に含めてください)。対象が定まったら、上記の所見の内容・検査結果の内容、または「診察中にすでに実施済みの追加検査」の中に、その対象と一致するものがすでにあるかを確認してください。一致の判断は「所見系か検査系か身体診察系か」のような大まかな分類だけで行わず、対象そのもの(例:腹部の診察、体温、血液検査など)が具体的に一致する場合に限ってください。一致するものがある場合は、それをそのまま使ってください(所見ならshowFindingsButton、検査結果ならshowLabButtonの対象とし、newTestRequestedは使わずfalseのままにしてください。同じ内容を別の名前の確認事項として新しく作らないでください)。②ケースに該当する具体的な対象の情報が無く、かつその場で確認・測定・診察・検査することがこの仕事の場面として物理的に自然に行える場合は、主訴との医学的・専門的な関連性の強さだけで足切りせず(関連が弱くても、その場で実施できる行為であれば)、最初のケース設計では想定していなかった新しい確認事項(検査に限らず、視診・触診・聴診・反射確認などの身体診察、測定、指定された職種・役割がその場面ですでに存在する情報源(記録・資料・管理情報など)を確認する行為、また視覚・触覚・聴覚・嗅覚・味覚・食感などで対象を直接確認して得られる情報(例:見た目・色・形・大きさ、触れた質感・硬さ・乾燥、聞こえた音、匂い、味、食感など)なども含む。例:血液検査・KOH検査・画像検査・ダーモスコピーなどの検査、血圧測定・体温測定、腹部の触診、胸部の聴診、咽頭の視診、膝蓋腱反射などの身体診察、指定された職種に自然な記録・資料の確認(医療ならカルテ・診療記録・申し送り、薬剤師なら処方内容・薬歴、受付なら予約・登録情報など、その仕事で自然に存在する情報源)、その他その場で確認・測定できる事項)として、それを実施したことにし、内部的な想定病態と矛盾しない結果を作ってください(newTestRequested=true、newTestLabelにその名称(日本語、短く、対象が分かるように。例:「腹部触診」「胸部聴診」「咽頭視診」「膝蓋腱反射」「血圧測定」)、newTestResultには、その結果をselfRole＝ユーザーがこの場面で自然に把握できる内容として、日本語で簡潔に書く(確認する側がcounterpartRoleであっても、newTestResultをcounterpartRole側の業務記録として書かず、selfRoleがこの場面で持っている・提示した・受け取った・確認できる情報として書く。情報量を減らす必要はなく、視点・言い回しだけをselfRole側に合わせる))。既存の所見・検査結果とも矛盾しないようにしてください。すでに同じ確認事項が行われている場合は新しく作らず、newTestRequestedはfalseのままにしてください。確認する側が新しい確認事項を要求していない通常のターンでは、newTestRequestedはfalseにしてください。③確認する側が確認しようとしている対象が、ケースにある所見・検査結果・追加検査のいずれとも異なる具体的な対象である場合、既存の情報を別の対象の結果として流用しないでください(例:腹部の触診を求められた場合に、ケースにあるのが体温の情報だけであれば、それを腹部の所見として見せてはいけません。血液検査を求められた場合に、ケースにあるのが血圧の情報だけであれば、それを血液検査結果として見せてはいけません)。この場合は②の要領で、求められた対象に合った結果を新たに作成してください。記録・資料の確認によって新たに得られる内容は、すでにケース概要(patientBrief)に書かれている情報をそのまま繰り返さないでください。ケース概要に無い、質問の内容に応じた新しい詳細を、内部的な想定(underlyingCondition)と矛盾しない範囲で生成してください。④求められた確認事項について、ケースに該当情報が無く、かつその場では確認・測定・結果提示ができないことがこの仕事の場面として自然な場合は、②と同じ仕組み(newTestRequested=true、newTestLabelにその名称)を使ってください。ただしこの場合のnewTestResultには、実際の数値・結果ではなく「まだ結果がありません(次回確認予定)」のような、結果が今は提供できないことを短く伝える文言を入れてください。この場合のpatientReplyは、「Of course.」「Sure.」のような、ごく短い相槌のみにしてください。結果が無いこと・待ち時間・いつ出るか・次回になること・結果を待っている状況などについて、counterpartRole側から自発的に説明・言及したり、逆にselfRoleに聞き返したりしないでください(これらの情報は基本的にnewTestResult側の表示だけで伝え、会話としては広げないでください)。ただし、selfRoleがそのターンで時期・理由などを明確に質問している場合は、この制限の対象外とし、通常通り自然に短く回答してください(この制限はcounterpartRole側から自発的に話題を広げないという意味であり、selfRoleからの質問への回答自体を禁止するものではありません)。これにより、結果が無いこの種のやり取りで不要な会話のターンを消費しないようにしてください。これは会話を引き延ばすための理由付けとして安易に使わないでください。実際にその仕事の現場で、要求された内容の結果がすぐには出せないことが自然な場合(例:外部委託の検査に日数がかかる、担当者が別におり今は確認できない、など)にだけ使い、単にケースに情報が用意されていないという理由だけで機械的にこの扱いにしないでください。すでに同じ確認事項についてこの扱いが行われている場合は、②と同様newTestRequestedはfalseのままにして重複させないでください。\n\n` +
+    `・selfRole・counterpartRoleのどちらか一方が、所見・検査結果・その他の確認事項を求めた場合は、次の優先順位で判断してください。確認・判断を行おうとしている側を「確認する側」、その内容を保持・提供する側を「確認される側」と呼びますが、どちらがselfRoleでどちらがcounterpartRoleかは固定されていません。今回のselfRole・counterpartRoleの関係と、直前までの会話の流れから、実際にどちらが確認する側でどちらが確認される側なのかを、その都度自然に判断してください(例:selfRoleが自分から何かを確認しようとしている場合はselfRoleが確認する側に、counterpartRoleが確認・提示を行っている場合はcounterpartRoleが確認する側になります)。①まず、確認する側が確認しようとしている対象を特定してください。対象は今回の発言だけで判断する必要はなく、今回の発言に明示されていない場合は、直前の会話の話題・流れから自然に1つの対象が読み取れるかを確認し、読み取れる場合はその対象を採用してください(例:一方が直前に何かを尋ね、確認する側が「確認します」とだけ答えた場合、その直前の話題が対象になります)。確認対象が会話の話題として登場しただけでは、newTestRequestedをtrueにしないでください。確認する側(selfRoleまたはcounterpartRole)が、その対象を実際に確認する意思・行動を示していることを必須条件とします。相手が話題として言及しただけで、確認する側がまだ確認を始めていない場合は、通常の応答にとどめてください。対象は、直前の会話で実際に具体的に話題になっていた事柄に限ってください。氏名・生年月日のような、場面や話題に関わらずどんな時でも存在してしまう一般的な基本情報を、対象が定まらない場合の代わりとして選ばないでください。今回の発言にも直前の会話にも、対象を特定できる手がかりが無い場合は、対象を勝手に作り出さず、通常の応答(確認行為ではない扱い)にとどめてください。対象が定まった場合は、次に、selfRoleがすでに自分の発言の中でその具体的な内容を明示しているかを確認してください(例:ユーザーが自分から氏名や予約番号をすでに名乗っている場合)。すでに明示されている場合は、newTestRequestedをtrueにせず、通常の応答にとどめてください。この場合、counterpartRoleはすでに伝えられた内容をそのまま使って自然に応答し、同じ内容を新たな確認事項として重ねて確認しないでください。まだ明示されていない場合は、次に、その確認について、selfRoleが具体的な内容(氏名・予約番号・希望条件など)を持っていて、その内容を答える・確認してもらう必要があるかを確認してください。selfRoleが物・資料を提示するだけで、その中身についてselfRole自身が具体的な内容を会話上答える必要が無い場合(例:身分証・パスポートなどを提示するだけで、記載内容を自分から答える必要はない場合)は、newTestRequestedをtrueにせず、通常の応答(確認行為ではない扱い)にとどめてください。selfRoleがその内容を持っていて、それを答える・確認してもらう必要がある場合(例:氏名・予約番号・希望条件などをselfRole自身が答える場合)は、次の判定に進んでください(これは「selfRoleが確認する側か確認される側か」とは別の判定であり、selfRoleが確認される側であっても、selfRoleが具体的な内容を答える必要があるなら対象に含めてください)。対象が定まったら、上記の所見の内容・検査結果の内容、または「診察中にすでに実施済みの追加検査」の中に、その対象と一致するものがすでにあるかを確認してください。一致の判断は「所見系か検査系か身体診察系か」のような大まかな分類だけで行わず、対象そのもの(例:腹部の診察、体温、血液検査など)が具体的に一致する場合に限ってください。一致するものがある場合は、それをそのまま使ってください(所見ならshowFindingsButton、検査結果ならshowLabButtonの対象とし、newTestRequestedは使わずfalseのままにしてください。同じ内容を別の名前の確認事項として新しく作らないでください)。②ケースに該当する具体的な対象の情報が無く、かつその場で確認・測定・診察・検査することがこの仕事の場面として物理的に自然に行える場合は、主訴との医学的・専門的な関連性の強さだけで足切りせず(関連が弱くても、その場で実施できる行為であれば)、最初のケース設計では想定していなかった新しい確認事項(検査に限らず、視診・触診・聴診・反射確認などの身体診察、測定、指定された職種・役割がその場面ですでに存在する情報源(記録・資料・管理情報など)を確認する行為、また視覚・触覚・聴覚・嗅覚・味覚・食感などで対象を直接確認して得られる情報(例:見た目・色・形・大きさ、触れた質感・硬さ・乾燥、聞こえた音、匂い、味、食感など)なども含む。例:血液検査・KOH検査・画像検査・ダーモスコピーなどの検査、血圧測定・体温測定、腹部の触診、胸部の聴診、咽頭の視診、膝蓋腱反射などの身体診察、指定された職種に自然な記録・資料の確認(医療ならカルテ・診療記録・申し送り、薬剤師なら処方内容・薬歴、受付なら予約・登録情報など、その仕事で自然に存在する情報源)、その他その場で確認・測定できる事項)として、それを実施したことにし、内部的な想定病態と矛盾しない結果を作ってください(newTestRequested=true、newTestLabelにその名称(日本語、短く、対象が分かるように。例:「腹部触診」「胸部聴診」「咽頭視診」「膝蓋腱反射」「血圧測定」)、newTestResultには、その結果をselfRole＝ユーザーがこの場面で自然に把握できる内容として、日本語で簡潔に書く(確認する側がcounterpartRoleであっても、newTestResultをcounterpartRole側の業務記録として書かず、selfRoleがこの場面で持っている・提示した・受け取った・確認できる情報として書く。情報量を減らす必要はなく、視点・言い回しだけをselfRole側に合わせる。ただし、newTestResultの内容は①で特定した対象についてのみ生成し、その対象と直接関係しない情報を、underlyingConditionやpatientBriefから先回りして補い、結果に混ぜ込まないでください(例:①で特定した対象が氏名だけであれば、氏名に関する結果だけを書き、まだ会話で確認されていない部屋タイプ・宿泊日数・食事条件などの別の情報を、この結果に含めないでください)。①で特定した対象について、会話の中ですでに自然に確認できている関連情報を含めることは構いません))。既存の所見・検査結果とも矛盾しないようにしてください。すでに同じ確認事項が行われている場合は新しく作らず、newTestRequestedはfalseのままにしてください。確認する側が新しい確認事項を要求していない通常のターンでは、newTestRequestedはfalseにしてください。③確認する側が確認しようとしている対象が、ケースにある所見・検査結果・追加検査のいずれとも異なる具体的な対象である場合、既存の情報を別の対象の結果として流用しないでください(例:腹部の触診を求められた場合に、ケースにあるのが体温の情報だけであれば、それを腹部の所見として見せてはいけません。血液検査を求められた場合に、ケースにあるのが血圧の情報だけであれば、それを血液検査結果として見せてはいけません)。この場合は②の要領で、求められた対象に合った結果を新たに作成してください。記録・資料の確認によって新たに得られる内容は、すでにケース概要(patientBrief)に書かれている情報をそのまま繰り返さないでください。ケース概要に無い、質問の内容に応じた新しい詳細を、内部的な想定(underlyingCondition)と矛盾しない範囲で生成してください。④求められた確認事項について、ケースに該当情報が無く、かつその場では確認・測定・結果提示ができないことがこの仕事の場面として自然な場合は、②と同じ仕組み(newTestRequested=true、newTestLabelにその名称)を使ってください。ただしこの場合のnewTestResultには、実際の数値・結果ではなく「まだ結果がありません(次回確認予定)」のような、結果が今は提供できないことを短く伝える文言を入れてください。この場合のpatientReplyは、「Of course.」「Sure.」のような、ごく短い相槌のみにしてください。結果が無いこと・待ち時間・いつ出るか・次回になること・結果を待っている状況などについて、counterpartRole側から自発的に説明・言及したり、逆にselfRoleに聞き返したりしないでください(これらの情報は基本的にnewTestResult側の表示だけで伝え、会話としては広げないでください)。ただし、selfRoleがそのターンで時期・理由などを明確に質問している場合は、この制限の対象外とし、通常通り自然に短く回答してください(この制限はcounterpartRole側から自発的に話題を広げないという意味であり、selfRoleからの質問への回答自体を禁止するものではありません)。これにより、結果が無いこの種のやり取りで不要な会話のターンを消費しないようにしてください。これは会話を引き延ばすための理由付けとして安易に使わないでください。実際にその仕事の現場で、要求された内容の結果がすぐには出せないことが自然な場合(例:外部委託の検査に日数がかかる、担当者が別におり今は確認できない、など)にだけ使い、単にケースに情報が用意されていないという理由だけで機械的にこの扱いにしないでください。すでに同じ確認事項についてこの扱いが行われている場合は、②と同様newTestRequestedはfalseのままにして重複させないでください。\n\n` +
     `次のJSON形式のみを出力してください(説明・コードブロック記号は不要です)。\n` +
     `{"showFindingsButton":true または false(ユーザーが所見を確認しようとする発言、または実際に特定の対象を観察・確認しようとする発言をした場合はtrue。対象は見る・触れる・聴く・匂いを確認する・味わう・測る・調べる・点検するなど、その職種で対象を直接確認する行為全般を含みます。判定は「確認」のような特定の単語の有無だけで機械的に行わず、発言の意味として対象を直接確認しようとしているかどうかで判断してください。「見てもいいですか？」のような、自分が確認する許可を求める発言だけでなく、「見せて」「触らせて」「聞かせて」「味見させて」のように、相手に対象を提示・体験させてもらうことを求め、その目的がユーザー自身による対象の確認・観察につながる発言も対象に含めてください(ただし、確認・観察を目的としているとは判断できない、単なる受け渡しの要求までtrueにする必要はありません)。対象が会話開始時点(openingLine)や直前のcounterpartRoleの発言ですでに提示・共有されている場合でも、ユーザーがその対象を自分で見たい・触りたい・聞きたい・味わいたい・測りたい・調べたい・点検したいなど、直接確認する意図を示した発言であればtrueにしてください。提示行為がすでに完了しているかどうかは、ユーザー自身による確認意図の判定を妨げません。「見てもいいですか？」のような曖昧な発言でも、直前の会話から対象が明確な場合はtrueにしてよい。ただし、その対象がケースの所見の内容と一致する場合に限る(対象がユーザー発言の中で明示的に名指しされていなくても、直前までの会話やopeningLineなどの文脈から対象が具体的に特定でき、かつその対象がケースの所見の内容に含まれており、かつユーザー発言がその対象を自分で直接確認する意図を示している場合は、この3点が揃っているとみなし、一致すると判断してください。文脈があるというだけで安易に一致とみなさないでください)),"showLabButton":true または false(ユーザーが検査結果を確認しようとする発言、または実際に体温・血圧などの測定や検査を行おうとする発言をした場合はtrue。ただし、その対象がケースの検査結果の内容と一致する場合に限る),"userConfirmedFindings":true または false(ユーザーが所見の内容について具体的に言及した場合、または所見を確認せずに所見に基づく医学的判断を発言した場合はtrue。実際の所見の値と矛盾していても構いません),"userConfirmedLab":true または false(ユーザーが検査結果の内容について具体的に言及した場合、または検査結果を確認せずに検査結果に基づく医学的判断を発言した場合はtrue。実際の検査結果の値と矛盾していても構いません),"newTestRequested":true または false,"newTestLabel":"確認事項の名称(日本語、検査に限らず身体診察・測定なども含む。newTestRequestedがfalseなら空文字)","newTestResult":"その結果(日本語、newTestRequestedがfalseなら空文字)"}`;
   try {
@@ -4122,12 +4204,12 @@ async function analyzeRoleplaySession(targetExpr, caseData, transcript, lang) {
     `・重要: このロールプレイの言語は${langOf(lang).nameJa}です。会話ログで「(${langOf(lang).nameJa}になっていない発言)」と印が付いているユーザー発言は、指定言語以外(英語混入・ピンインのみの表記など)で書かれています。これらは意味が推測できてもseverityを必ず"fix"にしてください("polish"や対象外にはしない、allGood=trueにもしない)。noteには文法の指摘ではなく「${langOf(lang).nameJa}で発言する必要があります。」という趣旨を明記してください${lang === "cn" ? `(ピンインのみの表記だった場合は「ピンインのみの表記は中国語の文字表記ではありません。」も付け加えてください)` : ""}。ユーザーに見せる言語名は必ず「${langOf(lang).nameJa}」という日本語表記を使い、英語の言語名(${langOf(lang).label}等)は使わないでください。また、この発言だけを根拠にtargetResultを"success"にしないでください。\n` +
     `■出力形式・文体\n` +
     `・targetNoteとnotesのtextは、評価レポートのような硬い言い方を避け、話しかけるような自然で短い日本語にしてください。「機能しており」「認められないため」「〜として扱われる」「〜として成立していることが確認できる」のような報告書的・機械的な言い回しは使わないでください。判定結果(success/needs_improvement/failure、severity、allGood)自体は変えず、あくまで説明の言い方だけを自然にしてください。例えば、目標を達成できた場合は「『红色还是留着』で『赤みがまだ残っています』という意味がちゃんと伝わっています。」のように、達成できなかった場合は「『红肿』は中国語ですが、今回の『赤みは少し良くなっています』という意味までは伝わっていません。」のように、それぞれ1文程度の短さで書いてください(これらは文体の参考例であり、そのまま使わず実際の内容に合わせて書いてください)。\n` +
-    `・重要: 会話ログの「医師発言(N)」のNは、そのユーザー発言が何番目の発言かを示す番号です。turnResultsの各結果オブジェクトには、対応する医師発言のNの値を必ず"userTurnNumber"として含めてください。ある発言についての指摘を、別の発言(1つ前や1つ後など)の結果に混ぜたり、ズレた番号で出力したりしないでください。修正内容(sentences)は、必ずそのuserTurnNumberが指す発言そのものに対する指摘にしてください。\n\n` +
+    `・重要: 会話ログの「${selfRole}発言(N)」のNは、そのユーザー発言が何番目の発言かを示す番号です。turnResultsの各結果オブジェクトには、対応する${selfRole}発言のNの値を必ず"userTurnNumber"として含めてください。ある発言についての指摘を、別の発言(1つ前や1つ後など)の結果に混ぜたり、ズレた番号で出力したりしないでください。修正内容(sentences)は、必ずそのuserTurnNumberが指す発言そのものに対する指摘にしてください。\n\n` +
     `作業:\n` +
     `1. 目標表現について、その日本語が伝えるべき内容を、必要な情報まで含めて自然に伝えられていれば"success"、内容の一部が伝わりにくい・必要な情報が欠けていれば"needs_improvement"、内容が伝わらない・意図が異なる・そもそも言えていなければ"failure"と判定してください(完全な文字列一致は不要です。より自然な言い方が他にあるという理由だけでは"success"を下げないでください)。この判定の理由を1文で書いてください(targetNote)。\n` +
-    `2. 会話ログの中の「医師発言(N)」は、全部で${userTurns.length}件あります。この${userTurns.length}件それぞれについて、1つずつ結果オブジェクトを作ってください(合計${userTurns.length}個)。各結果オブジェクトには、対応する発言のuserTurnNumber(1〜${userTurns.length}の整数)を必ず含めてください。\n` +
+    `2. 会話ログの中の「${selfRole}発言(N)」は、全部で${userTurns.length}件あります。この${userTurns.length}件それぞれについて、1つずつ結果オブジェクトを作ってください(合計${userTurns.length}個)。各結果オブジェクトには、対応する発言のuserTurnNumber(1〜${userTurns.length}の整数)を必ず含めてください。\n` +
     `   各ユーザー発言について確認してください。完全に自然な文(②が成立し、かつ語彙・文法・自然さ・丁寧さに問題が無い文)、および${fillerExample}のような重要度の低い短い発話は対象外にしてください。この判断は上記の②の基準だけで行い、③(目標表現を達成できているか)の結果とは関係ありません。\n` +
-    `   重要: 1つの医師発言(1つのuserTurnNumber)の中に複数の文が含まれている場合、それぞれの文を個別に確認・評価対象としてください。発言の前半にある文だけを見て後半の文の確認を省略しないでください。これは「First」「Second」のような特定の番号付け・形式がある場合に限った話ではなく、複数の文が接続詞・読点・改行などで自然に続けて話されている場合も同様です。sentences配列には、確認した結果fix・polishのどちらかに該当した文をそれぞれ別の要素として含めてください(該当しない完全に自然な文は、通常通り対象に含めなくて構いません)。\n` +
+    `   重要: 1つの${selfRole}発言(1つのuserTurnNumber)の中に複数の文が含まれている場合、それぞれの文を個別に確認・評価対象としてください。発言の前半にある文だけを見て後半の文の確認を省略しないでください。これは「First」「Second」のような特定の番号付け・形式がある場合に限った話ではなく、複数の文が接続詞・読点・改行などで自然に続けて話されている場合も同様です。sentences配列には、確認した結果fix・polishのどちらかに該当した文をそれぞれ別の要素として含めてください(該当しない完全に自然な文は、通常通り対象に含めなくて構いません)。\n` +
     `   指摘対象は、スペルミスのような単純な誤りだけでなく、二重否定・分かりにくい構文など「意味は推測できるが読み手/聞き手に負担をかける言い方」、および言い回しの丁寧さ・相手に対して失礼やぶっきらぼうに聞こえないかというニュアンスも含めてください(例:患者に対して命令口調・ぞんざいな言い方になっていないか)。\n` +
     `   severity="fix"を付けてよいのは、その発言自体の語彙・文法・表現上の問題によって、発言の意味そのものが理解できない・誤解を招く・失礼に聞こえる場合だけです。目標表現と違う内容を言っている、目標を達成できていない、場面の目的を果たしていない、ということだけを理由にseverity="fix"を付けないでください(目標を達成できているかどうかはtargetResult側で扱う判定であり、severityとは別です)。発言自体が語彙・文法・意味の上で成立しており、ただ目標と違う内容を言っているだけの場合は、severity="fix"を付けず、correctedListも作らないでください。originalが伝えている内容を変えずに、同じ内容をより自然な表現に直せる文にだけ severity="polish" を付けてください。originalの内容を目標表現の内容へ変えることはpolishではありません。\n` +
     `   1つの元の発言(original)を自然に直す際、文法的には1文であっても、独立して使い回せる意味のまとまり(節・フレーズ)が複数含まれる場合は、correctedListにそれぞれ別の要素として分けてください(例:「〜なので、〜することが大切です」のように接続詞でつながった2つの独立した内容は、2つの要素に分ける)。分ける必要が無い場合のみ1要素にしてください。correctedListの各要素は{"text":"独立して使える1文または1フレーズ","textJa":"その日本語訳"}の形にしてください。ただし、上記の「意味を解釈できない発言」に該当する場合、または発言自体は語彙・文法・意味の上で自然に成立しているが目標表現とは異なる内容を言っているだけの場合は、correctedListを空配列[]にしてください(後者の場合、発言自体を目標表現に置き換えた文を作らないでください)。${pinyinInstruction}\n` +
@@ -4135,7 +4217,7 @@ async function analyzeRoleplaySession(targetExpr, caseData, transcript, lang) {
     `   完全に自然だった文は対象に含めないでください。\n` +
     `   sentencesに severity="fix" の項目が1つも無ければallGoodをtrueにしてください(severity="polish"のみ、または対象なしの場合はallGood=trueで構いません)。fixが1つでもあればallGoodをfalseにしてください。\n\n` +
     `次のJSON形式のみを出力してください(説明・コードブロック記号は不要です)。\n` +
-    `{"targetResult":"success"または"needs_improvement"または"failure","targetNote":"判定理由(1文)","turnResults":[{"userTurnNumber":何番目の医師発言に対応するか(1〜${userTurns.length}の整数),"allGood":true または false,"sentences":[{"original":"元の発言","correctedList":[{"text":"修正後の1文","textJa":"その日本語訳"${lang === "cn" ? `,"pinyin":"その文のピンイン"` : ""}}](意味を解釈できない発言の場合は空配列[]),"notes":[{"category":"指摘の種類","text":"具体的な指摘"}],"severity":"fix"または"polish"}]}]}`;
+    `{"targetResult":"success"または"needs_improvement"または"failure","targetNote":"判定理由(1文)","turnResults":[{"userTurnNumber":何番目の${selfRole}発言に対応するか(1〜${userTurns.length}の整数),"allGood":true または false,"sentences":[{"original":"元の発言","correctedList":[{"text":"修正後の1文","textJa":"その日本語訳"${lang === "cn" ? `,"pinyin":"その文のピンイン"` : ""}}](意味を解釈できない発言の場合は空配列[]),"notes":[{"category":"指摘の種類","text":"具体的な指摘"}],"severity":"fix"または"polish"}]}]}`;
   // 長い会話(往復数が多い)ほど、ユーザー発言ごとの添削結果を含むJSON出力も長くなる。
   // 固定の上限だと長いロールプレイで出力が途中で切れ、JSON.parseが失敗する原因になっていたため、
   // 発言数に応じて上限を伸ばす(短い会話では従来通り、長い会話では余裕を持たせる)。
@@ -4789,8 +4871,8 @@ function RoleplayChatScreen({ targetExpr, caseData, lang, session, setSession, o
       return;
     }
     r.onresult = (ev) => {
-      const text = ev.results[0][0].transcript;
-      sendUserLine(text);
+      const text = postprocessRecognizedText(ev.results[0][0].transcript, langOf(lang).speech);
+      setAnswer(text);
     };
     r.onend = () => setListening(false);
     r.onerror = () => {
@@ -4808,10 +4890,7 @@ function RoleplayChatScreen({ targetExpr, caseData, lang, session, setSession, o
   };
 
   const speak = (text) => {
-    if (!window.speechSynthesis) return;
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = langOf(lang).speech;
-    window.speechSynthesis.speak(u);
+    speakOnce(text, langOf(lang).speech);
   };
 
   return (
@@ -5082,10 +5161,7 @@ function RoleplayReviewScreen({ targetExpr, caseData, transcript, lang, expressi
   }, [retryCount]);
 
   const speak = (text) => {
-    if (!window.speechSynthesis) return;
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = langOf(lang).speech;
-    window.speechSynthesis.speak(u);
+    speakOnce(text, langOf(lang).speech);
   };
 
   const saveCorrection = async (key, c) => {
